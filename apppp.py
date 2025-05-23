@@ -14,6 +14,7 @@ import time
 import re
 import json
 import csv
+import xlsxwriter
 import requests
 from datetime import datetime
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
@@ -27,33 +28,20 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import plotly.express as px
 import plotly.graph_objects as go
+from kneed import KneeLocator
+from nltk.tokenize import sent_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+import nltk
 import difflib
 
-# Try to import optional dependencies with fallbacks
+# Download NLTK resources (wrapped in try-except to handle offline scenarios)
 try:
-    from kneed import KneeLocator
-    KNEED_AVAILABLE = True
-except ImportError:
-    KNEED_AVAILABLE = False
-    st.warning("KneeLocator not available. Auto-clustering will use fallback method.")
-
-try:
-    import nltk
-    from nltk.tokenize import sent_tokenize
-    from nltk.corpus import stopwords
-    from nltk.stem import WordNetLemmatizer
-    NLTK_AVAILABLE = True
-    
-    # Download NLTK resources (wrapped in try-except to handle offline scenarios)
-    try:
-        nltk.download('punkt', quiet=True)
-        nltk.download('stopwords', quiet=True)
-        nltk.download('wordnet', quiet=True)
-    except Exception:
-        pass
-except ImportError:
-    NLTK_AVAILABLE = False
-    st.warning("NLTK not available. Some text processing features will be limited.")
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    nltk.download('wordnet', quiet=True)
+except Exception as e:
+    pass  # Will handle this gracefully during runtime
 
 # Directory paths for model persistence
 MODEL_DIR = "models"
@@ -75,11 +63,8 @@ VECTORIZER_PATH = os.path.join(MODEL_DIR, "vectorizer.pkl")
 SUMMARIZER_PATH = os.path.join(MODEL_DIR, "summarizer.pkl")
 
 # Import TensorFlow components
-try:
-        Tokenizer = tf.keras.preprocessing.text.Tokenizer
-        pad_sequences = tf.keras.preprocessing.sequence.pad_sequences
-except AttributeError:
-        st.error("TensorFlow Keras preprocessing not available")
+Tokenizer = tf.keras.preprocessing.text.Tokenizer
+pad_sequences = tf.keras.preprocessing.sequence.pad_sequences
 
 # ----------- Helper Functions -----------
 
@@ -93,8 +78,9 @@ def get_tesseract_path():
 # Try to set Tesseract path
 try:
     pytesseract.pytesseract.tesseract_cmd = get_tesseract_path()
-except Exception:
-    st.warning("Tesseract OCR path not configured. Please install Tesseract OCR.")
+except Exception as e:
+    # Will be handled during runtime
+    pass
 
 # ----------- Error Handling -----------
 
@@ -143,21 +129,13 @@ def create_rnn_model(input_length, num_classes, embedding_dim=128):
 @safe_process
 def extract_text_from_image(image, lang='eng'):
     """Extract text from an image with language support"""
-    try:
-        return pytesseract.image_to_string(image, lang=lang)
-    except Exception as e:
-        st.warning(f"OCR extraction failed: {e}")
-        return ""
+    return pytesseract.image_to_string(image, lang=lang)
 
 @safe_process
 def extract_text_from_pdf(pdf_file, lang='eng'):
     """Extract text from PDF with language support"""
-    try:
-        images = convert_from_path(pdf_file)
-        return "\n".join(extract_text_from_image(image, lang=lang) for image in images)
-    except Exception as e:
-        st.warning(f"PDF processing failed: {e}")
-        return ""
+    images = convert_from_path(pdf_file)
+    return "\n".join(extract_text_from_image(image, lang=lang) for image in images)
 
 # ----------- Text Analysis -----------
 
@@ -205,11 +183,6 @@ def extract_keywords(text, top_n=10):
         st.error(f"Error extracting keywords: {e}")
         return []
 
-def simple_sent_tokenize(text):
-    """Simple sentence tokenizer as fallback"""
-    sentences = re.split(r'[.!?]+', text)
-    return [s.strip() for s in sentences if s.strip()]
-
 def generate_summary(text, max_sentences=5):
     """Generate a summary using extractive summarization"""
     if not text or len(text) < 100:
@@ -217,10 +190,7 @@ def generate_summary(text, max_sentences=5):
     
     try:
         # Split text into sentences
-        if NLTK_AVAILABLE:
-            sentences = sent_tokenize(text)
-        else:
-            sentences = simple_sent_tokenize(text)
+        sentences = sent_tokenize(text)
         
         if len(sentences) <= max_sentences:
             return text
@@ -305,7 +275,7 @@ def process_files(file_list, language='eng'):
                 text = extract_text_from_image(Image.open(filepath), lang=language)
             
             # Generate summary and keywords if text is extracted
-            if text and text.strip():
+            if text.strip():
                 summary = generate_summary(text)
                 doc_keywords = extract_keywords(text)
                 
@@ -367,11 +337,10 @@ def get_files_from_zip(uploaded_zip):
 def get_files_from_folder(folder_path):
     """Get files from a local folder"""
     file_list = []
-    if os.path.exists(folder_path):
-        for root, _, files in os.walk(folder_path):
-            for file in files:
-                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.pdf', '.tiff', '.bmp')):
-                    file_list.append(os.path.join(root, file))
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.pdf', '.tiff', '.bmp')):
+                file_list.append(os.path.join(root, file))
     return file_list
 
 # ----------- Model Management -----------
@@ -441,20 +410,19 @@ def train_models(df, auto_save=True):
             st.error(f"Error training Naive Bayes model: {e}")
             return None, None, None, None, None
     
-    # Try to train RNN model
-    rnn_model = None
-    tokenizer = None
-    max_length = 100
-    
-    try:
-        with st.spinner("Preparing RNN data..."):
+    with st.spinner("Preparing RNN data..."):
+        try:
             tokenizer = Tokenizer(num_words=10000)
             tokenizer.fit_on_texts(texts)
             sequences = tokenizer.texts_to_sequences(texts)
             max_length = min(max([len(seq) for seq in sequences]) if sequences else 100, 500)
             padded_seq = pad_sequences(sequences, maxlen=max_length)
-        
-        with st.spinner("Training RNN model..."):
+        except Exception as e:
+            st.error(f"Error preparing RNN data: {e}")
+            return nb_model, None, None, label_map, unique_labels
+    
+    with st.spinner("Training RNN model..."):
+        try:
             rnn_model = create_rnn_model(max_length, len(unique_labels))
             # Add early stopping
             early_stopping = tf.keras.callbacks.EarlyStopping(
@@ -468,10 +436,9 @@ def train_models(df, auto_save=True):
                 callbacks=[early_stopping],
                 verbose=0
             )
-    except Exception as e:
-        st.warning(f"RNN model training failed: {e}. Continuing with Naive Bayes only.")
-        rnn_model = None
-        tokenizer = None
+        except Exception as e:
+            st.error(f"Error training RNN model: {e}")
+            return nb_model, None, tokenizer, label_map, unique_labels
     
     # Save the models if auto_save is True
     if auto_save:
@@ -494,6 +461,20 @@ def train_models(df, auto_save=True):
         save_model(metadata, METADATA_PATH)
     
     return nb_model, rnn_model, tokenizer, label_map, unique_labels
+
+def update_model_with_new_data(new_df):
+    """Update existing model with new data"""
+    # Get existing training data
+    training_df = load_training_data()
+    
+    # Add new data
+    combined_df = pd.concat([training_df, new_df]).drop_duplicates(subset=['filename'])
+    
+    # Save combined training data
+    combined_df.to_csv(TRAINING_DATA_PATH, index=False)
+    
+    # Train with combined data
+    return train_models(combined_df)
 
 def predict_with_models(df, nb_model, rnn_model, tokenizer, label_map, unique_labels, metadata=None):
     """Make predictions using trained models with improved error handling"""
@@ -527,14 +508,29 @@ def predict_with_models(df, nb_model, rnn_model, tokenizer, label_map, unique_la
             
             result_df["RNN_Label"] = rnn_labels
             result_df["RNN_Confidence"] = [f"{score:.2%}" for score in confidence_scores]
+            
+            # Create combined prediction field
+            result_df["Prediction"] = [
+                f"NB: {nb} | RNN: {rnn} ({conf})"
+                for nb, rnn, conf in zip(
+                    result_df["NaiveBayes_Label"], 
+                    rnn_labels, 
+                    [f"{score:.2%}" for score in confidence_scores]
+                )
+            ]
         except Exception as e:
             st.error(f"Error in RNN prediction: {e}")
             result_df["RNN_Label"] = ["Error" for _ in range(len(texts))]
             result_df["RNN_Confidence"] = ["N/A" for _ in range(len(texts))]
+            result_df["Prediction"] = [
+                f"NB: {nb} | RNN: Error"
+                for nb in result_df["NaiveBayes_Label"]
+            ]
     else:
         # If RNN model is not available, use only Naive Bayes
         result_df["RNN_Label"] = ["N/A" for _ in range(len(texts))]
         result_df["RNN_Confidence"] = ["N/A" for _ in range(len(texts))]
+        result_df["Prediction"] = [f"NB: {nb} | RNN: N/A" for nb in result_df["NaiveBayes_Label"]]
     
     return result_df
 
@@ -548,7 +544,7 @@ def load_saved_models():
         try:
             rnn_model = tf.keras.models.load_model(RNN_MODEL_PATH)
         except Exception as e:
-            st.warning(f"Could not load RNN model: {e}")
+            st.error(f"Error loading RNN model: {e}")
     
     if nb_model and metadata:
         return nb_model, rnn_model, metadata.get('tokenizer'), metadata.get('label_map'), metadata.get('unique_labels'), metadata
@@ -632,22 +628,12 @@ def get_optimal_clusters(vectorized_data, max_k=10):
         wcss.append(kmeans.inertia_)
     
     # Find elbow point
-    if KNEED_AVAILABLE:
-        try:
-            kl = KneeLocator(range(1, max_k + 1), wcss, curve="convex", direction="decreasing")
-            optimal_k = kl.elbow if kl.elbow else min(3, max_k)  # Default to 3 or max_k if smaller
-        except Exception as e:
-            st.warning(f"Error finding optimal clusters: {e}")
-            optimal_k = min(3, max_k)  # Fallback to 3 clusters if KneeLocator fails
-    else:
-        # Simple elbow detection fallback
-        if len(wcss) >= 3:
-            # Find the point with maximum decrease in slope
-            diffs = [wcss[i] - wcss[i+1] for i in range(len(wcss)-1)]
-            optimal_k = diffs.index(max(diffs)) + 2  # +2 because we start from k=1 and need the k value
-            optimal_k = min(optimal_k, max_k)
-        else:
-            optimal_k = min(3, max_k)
+    try:
+        kl = KneeLocator(range(1, max_k + 1), wcss, curve="convex", direction="decreasing")
+        optimal_k = kl.elbow if kl.elbow else min(3, max_k)  # Default to 3 or max_k if smaller
+    except Exception as e:
+        st.warning(f"Error finding optimal clusters: {e}")
+        optimal_k = min(3, max_k)  # Fallback to 3 clusters if KneeLocator fails
     
     return optimal_k, wcss
 
@@ -679,15 +665,21 @@ def reduce_dimensions(vectorized_data, method='pca', n_components=2, random_stat
         reducer = TruncatedSVD(n_components=n_components, random_state=random_state)
         return reducer.fit_transform(vectorized_data)
     elif method == 'tsne':
-        perplexity = min(30, vectorized_data.shape[0] - 1)
-        if perplexity < 1:
-            perplexity = 1
-        reducer = TSNE(n_components=n_components, random_state=random_state, perplexity=perplexity)
+        reducer = TSNE(n_components=n_components, random_state=random_state, perplexity=min(30, vectorized_data.shape[0]-1))
         return reducer.fit_transform(vectorized_data.toarray())
+    elif method == 'umap':
+        # Import UMAP only if needed
+        try:
+            import umap
+            reducer = umap.UMAP(n_components=n_components, random_state=random_state)
+            return reducer.fit_transform(vectorized_data.toarray())
+        except ImportError:
+            st.error("UMAP is not installed. Install with 'pip install umap-learn'")
+            # Fallback to PCA if UMAP is not available
+            reducer = PCA(n_components=n_components, random_state=random_state)
+            return reducer.fit_transform(vectorized_data.toarray())
     else:
-        # Fallback to PCA for unsupported methods
-        reducer = PCA(n_components=n_components, random_state=random_state)
-        return reducer.fit_transform(vectorized_data.toarray())
+        raise ValueError("Unsupported dimension reduction method")
 
 def plot_elbow_curve(wcss):
     """Plot elbow curve to help find optimal K"""
@@ -711,11 +703,28 @@ def plot_clusters_2d(df, reduced_data, kmeans):
         hover_name=df_plot['filename'],
         title="Document Clusters (2D View)",
         labels={'color': 'Cluster'},
-        color_continuous_scale=px.colors.qualitative.Set1
+        color_continuous_scale=px.colors.qualitative.G10
     )
     
+    # Add cluster centers if possible
+    try:
+        if hasattr(kmeans, 'cluster_centers_'):
+            # Try to use the same dimensionality reduction on centers
+            centers = kmeans.cluster_centers_
+            reducer = PCA(n_components=2)
+            centers_2d = reducer.fit_transform(centers)
+            
+            fig.add_scatter(
+                x=centers_2d[:, 0],
+                y=centers_2d[:, 1],
+                mode='markers',
+                marker=dict(color='black', size=15, symbol='x'),
+                name='Cluster Centers'
+            )
+    except Exception as e:
+        pass
+    
     return fig
-
 def plot_clusters_3d(df, reduced_data_3d, kmeans):
     """Plot 3D visualization of clusters"""
     df_plot = df.copy()
@@ -729,7 +738,7 @@ def plot_clusters_3d(df, reduced_data_3d, kmeans):
         hover_name=df_plot['filename'],
         title="Document Clusters (3D View)",
         labels={'color': 'Cluster'},
-        color_continuous_scale=px.colors.qualitative.Set1
+        color_continuous_scale=px.colors.qualitative.G10
     )
     
     fig.update_layout(
@@ -750,584 +759,597 @@ def get_top_cluster_terms(vectorizer, kmeans, n_terms=10):
     
     cluster_terms = {}
     for i in range(kmeans.n_clusters):
-        cluster_terms[i] = [terms[ind] for ind in order_centroids[i, :n_terms]]
+        top_terms = [terms[ind] for ind in order_centroids[i, :n_terms]]
+        cluster_terms[i] = top_terms
     
     return cluster_terms
 
-def export_results(df, format_type='csv'):
-    """Export results to different formats"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+def analyze_clusters(df, kmeans):
+    """Provide analysis of document clusters"""
+    df_analysis = df.copy()
+    df_analysis['Cluster'] = kmeans.labels_
     
-    if format_type == 'csv':
-        filename = f"document_analysis_{timestamp}.csv"
-        filepath = os.path.join(EXPORT_DIR, filename)
-        df.to_csv(filepath, index=False)
-        return filepath
-    elif format_type == 'json':
-        filename = f"document_analysis_{timestamp}.json"
-        filepath = os.path.join(EXPORT_DIR, filename)
-        df.to_json(filepath, orient='records', indent=2)
-        return filepath
-    elif format_type == 'excel':
-        filename = f"document_analysis_{timestamp}.xlsx"
-        filepath = os.path.join(EXPORT_DIR, filename)
-        df.to_excel(filepath, index=False)
-        return filepath
-    else:
-        return None
+    cluster_stats = {}
+    for cluster_id in range(kmeans.n_clusters):
+        cluster_docs = df_analysis[df_analysis['Cluster'] == cluster_id]
+        
+        if len(cluster_docs) > 0:
+            avg_length = cluster_docs['text'].apply(len).mean()
+            common_labels = cluster_docs['label'].value_counts().head(3).to_dict()
+            
+            cluster_stats[cluster_id] = {
+                'document_count': len(cluster_docs),
+                'avg_document_length': int(avg_length),
+                'most_common_labels': common_labels,
+                'sample_documents': cluster_docs['filename'].head(5).tolist()
+            }
+    
+    return cluster_stats
 
-def create_analysis_report(df, summaries, keywords, comparison_results=None):
-    """Create a comprehensive analysis report"""
-    report = {
-        "analysis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "total_documents": len(df),
-        "document_statistics": {
-            "avg_char_count": df['char_count'].mean() if 'char_count' in df.columns else 0,
-            "avg_word_count": df['word_count'].mean() if 'word_count' in df.columns else 0,
-            "languages_detected": df['language'].unique().tolist() if 'language' in df.columns else [],
-            "labels_found": df['label'].unique().tolist() if 'label' in df.columns else []
-        },
-        "summaries": summaries,
-        "keywords": keywords,
-        "comparison_results": comparison_results or {}
-    }
+# ----------- Export Functions -----------
+
+def export_to_csv(df, filename="document_analysis.csv"):
+    """Export analysis results to CSV"""
+    filepath = os.path.join(EXPORT_DIR, filename)
+    df.to_csv(filepath, index=False, quoting=csv.QUOTE_NONNUMERIC)
+    return filepath
+
+def export_to_excel(df, filename="document_analysis.xlsx"):
+    """Export analysis results to Excel with formatting"""
+    filepath = os.path.join(EXPORT_DIR, filename)
     
-    # Save report
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_filename = f"analysis_report_{timestamp}.json"
-    report_filepath = os.path.join(SUMMARY_DIR, report_filename)
+    with pd.ExcelWriter(filepath, engine='xlsxwriter') as writer:
+        df.to_excel(writer, sheet_name='Analysis Results', index=False)
+        
+        # Get workbook and worksheet objects
+        workbook = writer.book
+        worksheet = writer.sheets['Analysis Results']
+        
+        # Add formatting
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#D7E4BC',
+            'border': 1
+        })
+        
+        # Apply header format
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+            
+        # Adjust column widths
+        for i, col in enumerate(df.columns):
+            max_len = max(
+                df[col].astype(str).apply(len).max(),
+                len(str(col))
+            ) + 2
+            worksheet.set_column(i, i, min(max_len, 50))
     
-    with open(report_filepath, 'w') as f:
-        json.dump(report, f, indent=2)
+    return filepath
+
+def export_json(data, filename="document_analysis.json"):
+    """Export analysis results to JSON"""
+    filepath = os.path.join(EXPORT_DIR, filename)
     
-    return report, report_filepath
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    
+    return filepath
+
+def export_summaries(summaries, filename="document_summaries.txt"):
+    """Export document summaries to text file"""
+    filepath = os.path.join(SUMMARY_DIR, filename)
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        for doc_name, summary in summaries.items():
+            f.write(f"=== {doc_name} ===\n")
+            f.write(f"{summary}\n\n")
+    
+    return filepath
 
 # ----------- Streamlit UI -----------
 
 def main():
     st.set_page_config(
-        page_title="Advanced Document Analysis & OCR",
+        page_title="Document Analyzer",
         page_icon="📄",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
-    st.title("📄 Advanced Document Analysis & OCR System")
-    st.markdown("---")
+    # Custom CSS
+    st.markdown("""
+    <style>
+    .main {
+        background-color: #f5f7fa;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 10px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #e6f0ff;
+        border-radius: 4px 4px 0px 0px;
+        padding: 10px 16px;
+        gap: 4px;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #4c78a8 !important;
+        color: white !important;
+    }
+    .stButton>button {
+        background-color: #4c78a8;
+        color: white;
+        border-radius: 4px;
+    }
+    h1, h2, h3 {
+        color: #2c3e50;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
-    # Sidebar for navigation and settings
+    # App title
+    st.title("📄 Document Analyzer")
+    st.markdown("""
+    Upload documents (PDF, images) for automated text extraction, analysis, and classification.
+    """)
+    
+    # Sidebar for configuration
     with st.sidebar:
-        st.header("📚 Navigation")
-        page = st.selectbox(
-            "Choose a page:",
-            ["📄 Document Processing", "🤖 Model Training", "🔍 Document Search", 
-             "📊 Clustering Analysis", "📈 Analytics Dashboard", "⚙️ Settings"]
+        st.header("Configuration")
+        
+        # Input method selection
+        input_method = st.radio(
+            "Choose input method:",
+            ("Upload Files", "Upload ZIP", "Use Local Folder")
         )
         
-        st.header("🌐 Language Settings")
-        language = st.selectbox(
+        # OCR Language selection
+        ocr_language = st.selectbox(
             "OCR Language:",
-            ["eng", "spa", "fra", "deu", "ita", "por", "rus", "chi_sim", "jpn", "kor"],
-            help="Select the primary language for OCR processing"
+            ['eng', 'fra', 'deu', 'spa', 'ita', 'por', 'nld', 'chi_sim', 'chi_tra', 'jpn', 'kor'],
+            index=0
         )
-        
-        st.header("📊 Model Status")
-        # Check if models exist
-        nb_exists = os.path.exists(NB_MODEL_PATH)
-        rnn_exists = os.path.exists(RNN_MODEL_PATH)
-        
-        st.write(f"Naive Bayes: {'✅' if nb_exists else '❌'}")
-        st.write(f"RNN Model: {'✅' if rnn_exists else '❌'}")
-        
-        # Load existing training data stats
-        training_df = load_training_data()
-        if not training_df.empty:
-            st.write(f"Training samples: {len(training_df)}")
-            st.write(f"Unique labels: {len(training_df['label'].unique())}")
-    
-    # Main content based on selected page
-    if page == "📄 Document Processing":
-        document_processing_page(language)
-    elif page == "🤖 Model Training":
-        model_training_page()
-    elif page == "🔍 Document Search":
-        document_search_page()
-    elif page == "📊 Clustering Analysis":
-        clustering_analysis_page()
-    elif page == "📈 Analytics Dashboard":
-        analytics_dashboard_page()
-    elif page == "⚙️ Settings":
-        settings_page()
-
-def document_processing_page(language):
-    """Main document processing page"""
-    st.header("📄 Document Processing")
-    
-    # Input methods
-    input_method = st.radio(
-        "Choose input method:",
-        ["📁 Upload Files", "🗜️ Upload ZIP", "📂 Local Folder"],
-        horizontal=True
-    )
-    
-    file_list = []
-    
-    if input_method == "📁 Upload Files":
-        uploaded_files = st.file_uploader(
-            "Upload images or PDFs",
-            accept_multiple_files=True,
-            type=['png', 'jpg', 'jpeg', 'pdf', 'tiff', 'bmp']
-        )
-        if uploaded_files:
-            file_list = get_files_from_upload(uploaded_files)
-    
-    elif input_method == "🗜️ Upload ZIP":
-        uploaded_zip = st.file_uploader(
-            "Upload ZIP file containing images/PDFs",
-            type=['zip']
-        )
-        if uploaded_zip:
-            file_list = get_files_from_zip(uploaded_zip)
-    
-    elif input_method == "📂 Local Folder":
-        folder_path = st.text_input("Enter folder path:")
-        if folder_path and st.button("Load Files"):
-            file_list = get_files_from_folder(folder_path)
-    
-    if file_list:
-        st.success(f"Found {len(file_list)} files to process")
         
         # Processing options
-        col1, col2 = st.columns(2)
-        with col1:
-            process_files_btn = st.button("🚀 Process Files", type="primary")
-        with col2:
-            save_to_training = st.checkbox("Save to training data", value=True)
+        st.subheader("Processing Options")
         
-        if process_files_btn:
-            with st.spinner("Processing files..."):
-                dataset, all_text, classification_counts, individual_texts, summaries, keywords = process_files(file_list, language)
+        enable_summarization = st.checkbox("Generate summaries", value=True)
+        enable_keyword_extraction = st.checkbox("Extract keywords", value=True)
+        enable_classification = st.checkbox("Document classification", value=True)
+        enable_clustering = st.checkbox("Document clustering", value=True)
+        
+        if enable_clustering:
+            cluster_method = st.selectbox(
+                "Dimension Reduction Method:",
+                ("pca", "svd", "tsne", "umap"),
+                index=0
+            )
             
-            if dataset:
-                df = pd.DataFrame(dataset)
-                st.success(f"✅ Successfully processed {len(dataset)} documents")
+            auto_clusters = st.checkbox("Auto-detect clusters", value=True)
+            if not auto_clusters:
+                num_clusters = st.slider("Number of clusters", 2, 10, 3)
+        
+        # Advanced options
+        with st.expander("Advanced Options"):
+            summary_length = st.slider("Max summary sentences", 1, 15, 5)
+            keyword_count = st.slider("Keywords to extract", 5, 30, 10)
+            save_training_checkbox = st.checkbox("Save data for training", value=True)
+        
+        st.subheader("Models")
+        model_status = "No models loaded"
+        
+        nb_model, rnn_model, tokenizer, label_map, unique_labels, metadata = load_saved_models()
+        
+        if nb_model is not None:
+            model_status = "Models loaded successfully"
+            if metadata and 'last_updated' in metadata:
+                model_status += f"\nLast updated: {metadata['last_updated']}"
+            if metadata and 'num_samples' in metadata:
+                model_status += f"\nTrained on: {metadata['num_samples']} samples"
+        
+        st.info(model_status)
+        
+        if st.button("Train/Update Models"):
+            df = load_training_data()
+            if len(df) > 0:
+                nb_model, rnn_model, tokenizer, label_map, unique_labels, metadata = train_models(df)
+                st.success("Models trained successfully!")
+            else:
+                st.warning("No training data available")
+    
+    # Main content area with tabs
+    tabs = st.tabs(["Document Processing", "Search & Compare", "Analysis & Visualization", "Export"])
+    
+    with tabs[0]:
+        st.header("Document Processing")
+        
+        # File input based on selected method
+        uploaded_files = None
+        uploaded_zip = None
+        folder_path = None
+        
+        if input_method == "Upload Files":
+            uploaded_files = st.file_uploader(
+                "Upload PDF or image files",
+                type=["pdf", "png", "jpg", "jpeg", "tiff", "bmp"],
+                accept_multiple_files=True
+            )
+            
+            if uploaded_files:
+                file_list = get_files_from_upload(uploaded_files)
+                st.info(f"Uploaded {len(file_list)} files")
+        
+        elif input_method == "Upload ZIP":
+            uploaded_zip = st.file_uploader(
+                "Upload ZIP file containing documents",
+                type=["zip"]
+            )
+            
+            if uploaded_zip:
+                file_list = get_files_from_zip(uploaded_zip)
+                st.info(f"Extracted {len(file_list)} files from ZIP")
+        
+        elif input_method == "Use Local Folder":
+            folder_path = st.text_input("Enter folder path on server")
+            
+            if folder_path and os.path.isdir(folder_path):
+                file_list = get_files_from_folder(folder_path)
+                st.info(f"Found {len(file_list)} files in folder")
+            elif folder_path:
+                st.error("Invalid folder path")
+                file_list = []
+            else:
+                file_list = []
+        
+        # Process button
+        process_button = st.button("Process Documents")
+        
+        if process_button and 'file_list' in locals() and file_list:
+            with st.spinner("Processing documents..."):
+                # Process files
+                dataset, all_text, classification_counts, individual_texts, summaries, keywords = process_files(
+                    file_list, language=ocr_language
+                )
                 
-                # Display results
-                st.subheader("📊 Processing Results")
-                
-                # Statistics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Total Documents", len(dataset))
-                with col2:
-                    st.metric("Unique Labels", len(classification_counts))
-                with col3:
-                    st.metric("Avg Words/Doc", int(df['word_count'].mean()))
-                with col4:
-                    st.metric("Avg Chars/Doc", int(df['char_count'].mean()))
-                
-                # Document table
-                st.subheader("📋 Document Details")
-                display_df = df[['filename', 'label', 'word_count', 'char_count', 'processed_date']]
-                st.dataframe(display_df, use_container_width=True)
-                
-                # Individual document viewer
-                st.subheader("📖 Document Viewer")
-                selected_file = st.selectbox("Select document to view:", list(individual_texts.keys()))
-                
-                if selected_file:
+                if not dataset:
+                    st.error("No text could be extracted from the documents.")
+                else:
+                    # Convert to DataFrame
+                    df = pd.DataFrame(dataset)
+                    
+                    # Store in session state
+                    st.session_state.df = df
+                    st.session_state.individual_texts = individual_texts
+                    st.session_state.summaries = summaries
+                    st.session_state.keywords = keywords
+                    
+                    # Save training data if option is checked
+                    if save_training_checkbox:
+                        save_training_data(df)
+                    
+                    # Show success message
+                    st.success(f"✅ Processed {len(df)} documents successfully!")
+                    
+                    # Display statistics
                     col1, col2 = st.columns(2)
                     
                     with col1:
-                        st.write("**Full Text:**")
-                        st.text_area("", individual_texts[selected_file], height=300)
+                        st.subheader("Document Statistics")
+                        st.write(f"Total documents: {len(df)}")
+                        st.write(f"Total text extracted: {df['char_count'].sum()} characters")
+                        st.write(f"Average document length: {int(df['char_count'].mean())} characters")
                     
                     with col2:
-                        st.write("**Summary:**")
-                        st.text_area("", summaries.get(selected_file, "No summary available"), height=150)
+                        st.subheader("Document Labels")
+                        for label, count in classification_counts.items():
+                            st.write(f"{label}: {count} documents")
+                    
+                    # Classify documents if option is checked and models are available
+                    if enable_classification and nb_model is not None:
+                        with st.spinner("Classifying documents..."):
+                            try:
+                                # Make predictions
+                                result_df = predict_with_models(
+                                    df, nb_model, rnn_model, tokenizer, label_map, unique_labels, metadata
+                                )
+                                
+                                # Store results
+                                st.session_state.result_df = result_df
+                                
+                                # Show results
+                                st.subheader("Classification Results")
+                                st.dataframe(
+                                    result_df[["filename", "label", "NaiveBayes_Label", "RNN_Label", "RNN_Confidence"]]
+                                )
+                            except Exception as e:
+                                st.error(f"Error classifying documents: {e}")
+                    
+                    # Perform clustering if option is checked
+                    if enable_clustering and len(df) >= 3:
+                        with st.spinner("Clustering documents..."):
+                            try:
+                                # Create vectorizer
+                                vectorizer, vectorized_data = create_vectorizer(df)
+                                
+                                # Determine number of clusters
+                                if auto_clusters:
+                                    n_clusters, wcss = get_optimal_clusters(vectorized_data, max_k=min(10, len(df)-1))
+                                    st.info(f"Auto-detected optimal clusters: {n_clusters}")
+                                else:
+                                    n_clusters = num_clusters
+                                
+                                # Train KMeans
+                                kmeans = train_kmeans(vectorized_data, n_clusters=n_clusters)
+                                
+                                # Store in session state
+                                st.session_state.kmeans = kmeans
+                                st.session_state.vectorizer = vectorizer
+                                st.session_state.vectorized_data = vectorized_data
+                                
+                                # Add cluster info to results
+                                if hasattr(st.session_state, 'result_df'):
+                                    st.session_state.result_df['Cluster'] = kmeans.labels_
+                                
+                                # Show basic clustering results
+                                df_cluster = df.copy()
+                                df_cluster['Cluster'] = kmeans.labels_
+                                cluster_counts = df_cluster['Cluster'].value_counts()
+                                
+                                st.subheader("Clustering Results")
+                                for cluster_id, count in cluster_counts.items():
+                                    st.write(f"Cluster {cluster_id}: {count} documents")
+                            except Exception as e:
+                                st.error(f"Error clustering documents: {e}")
+                    
+                    # Display extracted text samples
+                    with st.expander("View Extracted Text Samples"):
+                        for i, (filename, text) in enumerate(list(individual_texts.items())[:3]):
+                            st.markdown(f"**{filename}**")
+                            st.text_area(f"Extracted text", text[:500] + "..." if len(text) > 500 else text, height=150)
+                            st.markdown("---")
+                    
+                    # Display summaries if option is checked
+                    if enable_summarization:
+                        with st.expander("View Document Summaries"):
+                            for filename, summary in summaries.items():
+                                st.markdown(f"**{filename}**")
+                                st.write(summary)
+                                st.markdown("---")
+                    
+                    # Display keywords if option is checked
+                    if enable_keyword_extraction:
+                        with st.expander("View Extracted Keywords"):
+                            for filename, kw_list in keywords.items():
+                                st.markdown(f"**{filename}**")
+                                if kw_list:
+                                    for keyword, score in kw_list:
+                                        st.write(f"- {keyword} ({score:.3f})")
+                                else:
+                                    st.write("No keywords extracted")
+                                st.markdown("---")
+        
+        elif process_button:
+            st.warning("Please upload or select files first")
+    
+    # Search & Compare tab
+    with tabs[1]:
+        st.header("Search & Compare Documents")
+        
+        if hasattr(st.session_state, 'individual_texts') and st.session_state.individual_texts:
+            # Search feature
+            st.subheader("Search Documents")
+            search_query = st.text_input("Enter search term")
+            
+            if search_query:
+                search_results = search_documents(st.session_state.individual_texts, search_query)
+                
+                if search_results:
+                    st.write(f"Found {len(search_results)} results")
+                    
+                    for result in search_results:
+                        with st.expander(f"{result['filename']} (Score: {result['score']:.2f})"):
+                            st.markdown(f"**Match type:** {result['match_type']}")
+                            st.markdown(f"**Context:**")
+                            st.markdown(result['context'].replace(search_query, f"**{search_query}**"))
+                else:
+                    st.info("No results found")
+            
+            # Document comparison
+            st.subheader("Compare Documents")
+            
+            document_options = list(st.session_state.individual_texts.keys())
+            if len(document_options) >= 2:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    doc1 = st.selectbox("First Document", document_options, index=0)
+                
+                with col2:
+                    remaining_options = [doc for doc in document_options if doc != doc1]
+                    doc2 = st.selectbox("Second Document", remaining_options, index=0)
+                
+                if st.button("Compare Documents"):
+                    with st.spinner("Comparing documents..."):
+                        text1 = st.session_state.individual_texts[doc1]
+                        text2 = st.session_state.individual_texts[doc2]
                         
-                        st.write("**Keywords:**")
-                        if selected_file in keywords and keywords[selected_file]:
-                            for keyword, score in keywords[selected_file][:10]:
-                                st.write(f"• {keyword} ({score:.3f})")
-                        else:
-                            st.write("No keywords extracted")
-                
-                # Export options
-                st.subheader("💾 Export Options")
-                export_col1, export_col2, export_col3 = st.columns(3)
-                
-                with export_col1:
-                    if st.button("Export CSV"):
-                        filepath = export_results(df, 'csv')
-                        if filepath:
-                            st.success(f"Exported to {filepath}")
-                
-                with export_col2:
-                    if st.button("Export JSON"):
-                        filepath = export_results(df, 'json')
-                        if filepath:
-                            st.success(f"Exported to {filepath}")
-                
-                with export_col3:
-                    if st.button("Create Report"):
-                        report, report_path = create_analysis_report(df, summaries, keywords)
-                        st.success(f"Report created: {report_path}")
-                
-                # Save to training data
-                if save_to_training:
-                    if save_training_data(df):
-                        st.success("📚 Data saved to training dataset")
-                    else:
-                        st.error("❌ Failed to save training data")
-                
-                # Store in session state for other pages
-                st.session_state['current_df'] = df
-                st.session_state['individual_texts'] = individual_texts
-                st.session_state['summaries'] = summaries
-                st.session_state['keywords'] = keywords
-
-def model_training_page():
-    """Model training and prediction page"""
-    st.header("🤖 Model Training & Prediction")
-    
-    # Load existing training data
-    training_df = load_training_data()
-    
-    if training_df.empty:
-        st.warning("⚠️ No training data available. Please process some documents first.")
-        return
-    
-    # Display training data statistics
-    st.subheader("📊 Training Data Overview")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Samples", len(training_df))
-    with col2:
-        st.metric("Unique Labels", len(training_df['label'].unique()))
-    with col3:
-        st.metric("Avg Words/Doc", int(training_df['word_count'].mean()))
-    
-    # Show label distribution
-    st.subheader("📈 Label Distribution")
-    label_counts = training_df['label'].value_counts()
-    fig = px.bar(x=label_counts.index, y=label_counts.values, title="Document Count by Label")
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Training controls
-    st.subheader("🏋️ Model Training")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        train_btn = st.button("🚀 Train Models", type="primary")
-    with col2:
-        auto_save = st.checkbox("Auto-save models", value=True)
-    
-    if train_btn:
-        with st.spinner("Training models... This may take a few minutes."):
-            nb_model, rnn_model, tokenizer, label_map, unique_labels = train_models(training_df, auto_save)
-        
-        if nb_model:
-            st.success("✅ Models trained successfully!")
-            
-            # Store models in session state
-            st.session_state['nb_model'] = nb_model
-            st.session_state['rnn_model'] = rnn_model
-            st.session_state['tokenizer'] = tokenizer
-            st.session_state['label_map'] = label_map
-            st.session_state['unique_labels'] = unique_labels
+                        comparison_results = compare_documents(text1, text2)
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.metric("Similarity Ratio", f"{comparison_results['similarity_ratio']:.2f}")
+                        
+                        with col2:
+                            st.metric("Cosine Similarity", f"{comparison_results['cosine_similarity']:.2f}")
+                        
+                        with col3:
+                            st.metric("Common Words", comparison_results['common_word_count'])
+                        
+                        st.markdown("### Common Terms")
+                        st.write(", ".join(comparison_results['common_words']))
+            else:
+                st.info("Upload at least two documents to compare")
         else:
-            st.error("❌ Model training failed")
+            st.info("Process documents first to use search and comparison features")
     
-    # Prediction section
-    st.subheader("🔮 Make Predictions")
-    
-    # Check if we have models
-    if 'nb_model' in st.session_state or os.path.exists(NB_MODEL_PATH):
-        # Load models if not in session state
-        if 'nb_model' not in st.session_state:
-            nb_model, rnn_model, tokenizer, label_map, unique_labels, metadata = load_saved_models()
-            if nb_model:
-                st.session_state['nb_model'] = nb_model
-                st.session_state['rnn_model'] = rnn_model
-                st.session_state['tokenizer'] = tokenizer
-                st.session_state['label_map'] = label_map
-                st.session_state['unique_labels'] = unique_labels
-                st.session_state['metadata'] = metadata
+    # Analysis & Visualization tab
+    with tabs[2]:
+        st.header("Analysis & Visualization")
         
-        # Prediction input
-        prediction_text = st.text_area("Enter text for prediction:", height=150)
-        
-        if prediction_text and st.button("🎯 Predict"):
-            # Create temporary dataframe for prediction
-            pred_df = pd.DataFrame({
-                'filename': ['user_input'],
-                'text': [prediction_text],
-                'label': ['unknown']
-            })
+        if hasattr(st.session_state, 'vectorized_data') and hasattr(st.session_state, 'kmeans'):
+            # Clustering visualization
+            st.subheader("Document Clustering")
             
-            # Make prediction
-            result_df = predict_with_models(
-                pred_df,
-                st.session_state['nb_model'],
-                st.session_state.get('rnn_model'),
-                st.session_state.get('tokenizer'),
-                st.session_state.get('label_map'),
-                st.session_state.get('unique_labels'),
-                st.session_state.get('metadata')
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # 2D visualization
+                reduced_data = reduce_dimensions(
+                    st.session_state.vectorized_data, 
+                    method=cluster_method,
+                    n_components=2
+                )
+                fig_2d = plot_clusters_2d(st.session_state.df, reduced_data, st.session_state.kmeans)
+                st.plotly_chart(fig_2d, use_container_width=True)
+            
+            with col2:
+                # 3D visualization
+                reduced_data_3d = reduce_dimensions(
+                    st.session_state.vectorized_data, 
+                    method=cluster_method,
+                    n_components=3
+                )
+                fig_3d = plot_clusters_3d(st.session_state.df, reduced_data_3d, st.session_state.kmeans)
+                st.plotly_chart(fig_3d, use_container_width=True)
+            
+            # Cluster analysis
+            st.subheader("Cluster Analysis")
+            
+            # Get top terms per cluster
+            top_terms = get_top_cluster_terms(st.session_state.vectorizer, st.session_state.kmeans)
+            
+            # Get cluster statistics
+            cluster_stats = analyze_clusters(st.session_state.df, st.session_state.kmeans)
+            
+            # Display cluster details
+            for cluster_id in range(st.session_state.kmeans.n_clusters):
+                with st.expander(f"Cluster {cluster_id} ({cluster_stats[cluster_id]['document_count']} documents)"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write("**Top terms:**")
+                        st.write(", ".join(top_terms[cluster_id]))
+                        
+                        st.write("**Most common labels:**")
+                        for label, count in cluster_stats[cluster_id]['most_common_labels'].items():
+                            st.write(f"- {label}: {count}")
+                    
+                    with col2:
+                        st.write("**Sample documents:**")
+                        for doc in cluster_stats[cluster_id]['sample_documents']:
+                            st.write(f"- {doc}")
+                        
+                        st.write(f"**Avg. document length:** {cluster_stats[cluster_id]['avg_document_length']} chars")
+            
+            # Elbow curve visualization
+            if 'auto_clusters' in locals() and auto_clusters:
+                st.subheader("Cluster Optimization")
+                n_clusters, wcss = get_optimal_clusters(st.session_state.vectorized_data)
+                fig_elbow = plot_elbow_curve(wcss)
+                st.pyplot(fig_elbow)
+        
+        elif hasattr(st.session_state, 'df'):
+            # Basic document statistics
+            st.subheader("Document Statistics")
+            
+            # Length distribution
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.hist(st.session_state.df['char_count'], bins=20, alpha=0.7)
+            ax.set_xlabel('Document Length (characters)')
+            ax.set_ylabel('Count')
+            ax.set_title('Document Length Distribution')
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            
+            # Document count by label
+            if 'label' in st.session_state.df.columns:
+                label_counts = st.session_state.df['label'].value_counts()
+                
+                fig = px.bar(
+                    x=label_counts.index,
+                    y=label_counts.values,
+                    labels={'x': 'Document Label', 'y': 'Count'},
+                    title='Document Count by Label',
+                    color=label_counts.values,
+                    color_continuous_scale=px.colors.sequential.Viridis
+                )
+                st.plotly_chart(fig)
+        else:
+            st.info("Process documents first to view analysis and visualizations")
+    
+    # Export tab
+    with tabs[3]:
+        st.header("Export Results")
+        
+        if hasattr(st.session_state, 'df'):
+            export_format = st.radio(
+                "Export format:",
+                ("CSV", "Excel", "JSON", "Text Summaries")
             )
             
-            # Display results
-            st.subheader("🎯 Prediction Results")
-            col1, col2 = st.columns(2)
+            export_button = st.button("Export Data")
             
-            with col1:
-                st.write("**Naive Bayes Prediction:**")
-                st.write(f"Label: {result_df['NaiveBayes_Label'].iloc[0]}")
-            
-            with col2:
-                st.write("**RNN Prediction:**")
-                st.write(f"Label: {result_df['RNN_Label'].iloc[0]}")
-                st.write(f"Confidence: {result_df['RNN_Confidence'].iloc[0]}")
-    else:
-        st.info("ℹ️ Train models first to enable predictions")
-
-def document_search_page():
-    """Document search page"""
-    st.header("🔍 Document Search")
-    
-    if 'individual_texts' not in st.session_state:
-        st.warning("⚠️ No documents loaded. Please process documents first.")
-        return
-    
-    # Search interface
-    search_query = st.text_input("🔍 Enter search query:", placeholder="Search for keywords, phrases, or concepts...")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        search_btn = st.button("🔍 Search", type="primary")
-    with col2:
-        threshold = st.slider("Similarity Threshold", 0.0, 1.0, 0.2, 0.1)
-    
-    if search_query and search_btn:
-        # Perform search
-        results = search_documents(st.session_state['individual_texts'], search_query, threshold)
-        
-        if results:
-            st.success(f"Found {len(results)} matching documents")
-            
-            # Display results
-            for i, result in enumerate(results):
-                with st.expander(f"📄 {result['filename']} (Score: {result['score']:.3f})"):
-                    st.write(f"**Match Type:** {result['match_type'].title()}")
-                    st.write(f"**Relevance Score:** {result['score']:.3f}")
-                    st.write("**Context:**")
-                    st.text_area("", result['context'], height=100, key=f"context_{i}")
+            if export_button:
+                with st.spinner("Exporting data..."):
+                    try:
+                        # Different export based on format
+                        if export_format == "CSV":
+                            # Export analysis results to CSV
+                            if hasattr(st.session_state, 'result_df'):
+                                filepath = export_to_csv(st.session_state.result_df)
+                            else:
+                                filepath = export_to_csv(st.session_state.df)
+                        
+                        elif export_format == "Excel":
+                            # Export analysis results to Excel
+                            if hasattr(st.session_state, 'result_df'):
+                                filepath = export_to_excel(st.session_state.result_df)
+                            else:
+                                filepath = export_to_excel(st.session_state.df)
+                        
+                        elif export_format == "JSON":
+                            # Export as JSON
+                            export_data = {
+                                "documents": st.session_state.df.to_dict(orient='records')
+                            }
+                            
+                            # Add predictions if available
+                            if hasattr(st.session_state, 'result_df'):
+                                export_data["predictions"] = st.session_state.result_df.to_dict(orient='records')
+                            
+                            # Add clustering if available
+                            if hasattr(st.session_state, 'kmeans'):
+                                export_data["clusters"] = analyze_clusters(
+                                    st.session_state.df, st.session_state.kmeans
+                                )
+                            
+                            filepath = export_json(export_data)
+                        
+                        elif export_format == "Text Summaries":
+                            # Export summaries as text
+                            if hasattr(st.session_state, 'summaries'):
+                                filepath = export_summaries(st.session_state.summaries)
+                            else:
+                                st.error("No summaries available")
+                                filepath = None
+                        
+                        if filepath:
+                            st.success(f"✅ Exported successfully to: {filepath}")
+                    except Exception as e:
+                        st.error(f"Export failed: {e}")
         else:
-            st.info("No matching documents found. Try adjusting the search query or threshold.")
+            st.info("Process documents first to export results")
 
-def clustering_analysis_page():
-    """Document clustering analysis page"""
-    st.header("📊 Document Clustering Analysis")
-    
-    # Check if we have current data
-    if 'current_df' not in st.session_state:
-        st.warning("⚠️ No documents loaded. Please process documents first.")
-        return
-    
-    df = st.session_state['current_df']
-    
-    if len(df) < 2:
-        st.warning("⚠️ Need at least 2 documents for clustering analysis.")
-        return
-    
-    # Clustering controls
-    st.subheader("⚙️ Clustering Settings")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        auto_clusters = st.checkbox("Auto-detect optimal clusters", value=True)
-        if not auto_clusters:
-            n_clusters = st.slider("Number of clusters", 2, min(10, len(df)), 3)
-    with col2:
-        dim_reduction = st.selectbox("Dimension Reduction", ["pca", "svd", "tsne"])
-    
-    if st.button("🚀 Perform Clustering Analysis", type="primary"):
-        with st.spinner("Performing clustering analysis..."):
-            # Create vectorizer and vectorize documents
-            vectorizer, vectorized_data = create_vectorizer(df)
-            
-            # Determine optimal number of clusters
-            if auto_clusters:
-                optimal_k, wcss = get_optimal_clusters(vectorized_data, max_k=min(10, len(df)-1))
-                st.info(f"Optimal number of clusters detected: {optimal_k}")
-            else:
-                optimal_k = n_clusters
-                _, wcss = get_optimal_clusters(vectorized_data, max_k=min(10, len(df)-1))
-            
-            # Train K-means
-            kmeans = train_kmeans(vectorized_data, optimal_k)
-            
-            # Add cluster labels to dataframe
-            df_clustered = df.copy()
-            df_clustered['Cluster'] = kmeans.labels_
-            
-            # Results display
-            st.subheader("📊 Clustering Results")
-            
-            # Cluster statistics
-            cluster_stats = df_clustered['Cluster'].value_counts().sort_index()
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write("**Cluster Distribution:**")
-                for cluster_id, count in cluster_stats.items():
-                    st.write(f"Cluster {cluster_id}: {count} documents")
-            
-            with col2:
-                # Elbow curve
-                st.write("**Elbow Curve:**")
-                elbow_fig = plot_elbow_curve(wcss)
-                st.pyplot(elbow_fig)
-            
-            # Visualization
-            st.subheader("📈 Cluster Visualization")
-            
-            # 2D visualization
-            reduced_data_2d = reduce_dimensions(vectorized_data, dim_reduction, 2)
-            cluster_fig_2d = plot_clusters_2d(df_clustered, reduced_data_2d, kmeans)
-            st.plotly_chart(cluster_fig_2d, use_container_width=True)
-            
-            # 3D visualization
-            if len(df) > 3:
-                reduced_data_3d = reduce_dimensions(vectorized_data, dim_reduction, 3)
-                cluster_fig_3d = plot_clusters_3d(df_clustered, reduced_data_3d, kmeans)
-                st.plotly_chart(cluster_fig_3d, use_container_width=True)
-            
-            # Top terms per cluster
-            st.subheader("🏷️ Cluster Characteristics")
-            cluster_terms = get_top_cluster_terms(vectorizer, kmeans, n_terms=10)
-            
-            for cluster_id, terms in cluster_terms.items():
-                st.write(f"**Cluster {cluster_id} Top Terms:** {', '.join(terms)}")
-            
-            # Detailed cluster view
-            st.subheader("📋 Documents by Cluster")
-            selected_cluster = st.selectbox("Select cluster to view:", sorted(df_clustered['Cluster'].unique()))
-            
-            cluster_docs = df_clustered[df_clustered['Cluster'] == selected_cluster]
-            st.dataframe(cluster_docs[['filename', 'label', 'word_count']], use_container_width=True)
-
-def analytics_dashboard_page():
-    """Analytics dashboard page"""
-    st.header("📈 Analytics Dashboard")
-    
-    # Load all available data
-    training_df = load_training_data()
-    
-    if training_df.empty:
-        st.warning("⚠️ No data available for analytics.")
-        return
-    
-    # Overall statistics
-    st.subheader("📊 Overall Statistics")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Documents", len(training_df))
-    with col2:
-        st.metric("Unique Labels", len(training_df['label'].unique()))
-    with col3:
-        st.metric("Avg Words/Doc", int(training_df['word_count'].mean()))
-    with col4:
-        st.metric("Processing Languages", len(training_df['language'].unique()))
-    
-    # Time series analysis
-    if 'processed_date' in training_df.columns:
-        st.subheader("📅 Processing Timeline")
-        training_df['processed_date'] = pd.to_datetime(training_df['processed_date'])
-        daily_counts = training_df.groupby(training_df['processed_date'].dt.date).size().reset_index()
-        daily_counts.columns = ['date', 'count']
-        
-        timeline_fig = px.line(daily_counts, x='date', y='count', title="Documents Processed Over Time")
-        st.plotly_chart(timeline_fig, use_container_width=True)
-    
-    # Word count distribution
-    st.subheader("📊 Word Count Distribution")
-    word_count_fig = px.histogram(training_df, x='word_count', title="Distribution of Document Word Counts")
-    st.plotly_chart(word_count_fig, use_container_width=True)
-    
-    # Label analysis
-    st.subheader("🏷️ Label Analysis")
-    label_stats = training_df['label'].value_counts()
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        pie_fig = px.pie(values=label_stats.values, names=label_stats.index, title="Document Distribution by Label")
-        st.plotly_chart(pie_fig, use_container_width=True)
-    
-    with col2:
-        bar_fig = px.bar(x=label_stats.index, y=label_stats.values, title="Document Count by Label")
-        st.plotly_chart(bar_fig, use_container_width=True)
-
-def settings_page():
-    """Settings and configuration page"""
-    st.header("⚙️ Settings & Configuration")
-    
-    # Model management
-    st.subheader("🤖 Model Management")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🗑️ Clear All Models"):
-            model_files = [NB_MODEL_PATH, RNN_MODEL_PATH, METADATA_PATH, KMEANS_MODEL_PATH, VECTORIZER_PATH]
-            for file_path in model_files:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            st.success("✅ All models cleared")
-    
-    with col2:
-        if st.button("🗑️ Clear Training Data"):
-            if os.path.exists(TRAINING_DATA_PATH):
-                os.remove(TRAINING_DATA_PATH)
-            st.success("✅ Training data cleared")
-    
-    # Directory information
-    st.subheader("📁 Directory Information")
-    directories = {
-        "Models": MODEL_DIR,
-        "Training Data": DATA_DIR,
-        "Exports": EXPORT_DIR,
-        "Summaries": SUMMARY_DIR
-    }
-    
-    for name, path in directories.items():
-        file_count = len([f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]) if os.path.exists(path) else 0
-        st.write(f"**{name}:** {path} ({file_count} files)")
-    
-    # System info
-    st.subheader("💻 System Information")
-    st.write(f"**TensorFlow Version:** {tf.__version__}")
-    st.write(f"**NLTK Available:** {'✅' if NLTK_AVAILABLE else '❌'}")
-    st.write(f"**KneeLocator Available:** {'✅' if KNEED_AVAILABLE else '❌'}")
-    
-    # Advanced settings
-    st.subheader("🔧 Advanced Settings")
-    
-    # Clear session state
-    if st.button("🔄 Clear Session State"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.success("✅ Session state cleared")
-    
-    # Export all data
-    if st.button("📦 Export All Data"):
-        training_df = load_training_data()
-        if not training_df.empty:
-            export_path = export_results(training_df, 'csv')
-            st.success(f"✅ All data exported to {export_path}")
-        else:
-            st.warning("⚠️ No data to export")
-
+# Run the application
 if __name__ == "__main__":
     main()
